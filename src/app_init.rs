@@ -131,6 +131,8 @@ impl EntropyApp {
             application_layout_foreground: None,
             #[cfg(not(target_arch = "wasm32"))]
             application_layout_manual_override: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            default_layout_sync_retry_after: None,
             application_picker_open: false,
             application_picker_assign_existing: false,
             application_picker_target_layout_id: None,

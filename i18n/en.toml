@@ -31,6 +31,7 @@ show_hide_keys_click = "Left click a key or encoder to show or hide it"
 show_hide_keys_exit = "Right click or Esc to finish"
 
 [layer_actions]
+save_default_to_device = "Save Default to Macropad"
 menu = "Layer operations"
 menu_tooltip = "Layer actions"
 copy = "Copy layer"

@@ -31,6 +31,7 @@ show_hide_keys_click = "ЛКМ по клавише или энкодеру — �
 show_hide_keys_exit = "ПКМ или Esc — завершить"
 
 [layer_actions]
+save_default_to_device = "Запись Default в макропад"
 menu = "Операции со слоем"
 menu_tooltip = "Действия со слоем"
 copy = "Копировать слой"
