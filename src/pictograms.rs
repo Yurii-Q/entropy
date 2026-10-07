@@ -2286,12 +2286,12 @@ mod tests {
         assert!(mirrored_horizontally(&middle_button, &middle_button));
         assert!(mirrored_horizontally(&move_left, &move_right));
 
-        // Direction arrows reach the corresponding edge and stay distinct
+        // Direction arrows stop one pixel from the edge and stay distinct
         // from the centered mouse body.
-        assert!(bitmap_pixel(&builtin_pictogram_bitmap(27), 17, 0));
-        assert!(bitmap_pixel(&builtin_pictogram_bitmap(28), 17, 34));
-        assert!(bitmap_pixel(&move_left, 0, 17));
-        assert!(bitmap_pixel(&move_right, 34, 17));
+        assert!(bitmap_pixel(&builtin_pictogram_bitmap(27), 17, 1));
+        assert!(bitmap_pixel(&builtin_pictogram_bitmap(28), 17, 33));
+        assert!(bitmap_pixel(&move_left, 1, 17));
+        assert!(bitmap_pixel(&move_right, 33, 17));
     }
 }
 
