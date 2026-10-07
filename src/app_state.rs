@@ -2566,8 +2566,8 @@ impl Default for DisplaySettingsState {
             date: DATE_DEFAULT,
             confirmed_date: DATE_DEFAULT,
             supported: false,
-            color: [200, 178, 146],
-            confirmed_color: [200, 178, 146],
+            color: [209, 177, 139],
+            confirmed_color: [209, 177, 139],
             background_color_supported: false,
             background_color: [0, 0, 0],
             confirmed_background_color: [0, 0, 0],
@@ -2585,8 +2585,8 @@ impl Default for DisplaySettingsState {
             startup_image_preview_rgba: Vec::new(),
             startup_image_preview_revision: 0,
             clock_settings_supported: false,
-            clock_text_color: [255, 255, 255],
-            confirmed_clock_text_color: [255, 255, 255],
+            clock_text_color: [209, 177, 139],
+            confirmed_clock_text_color: [209, 177, 139],
             clock_overlay_controls_supported: false,
             clock_visible: true,
             confirmed_clock_visible: true,
@@ -2598,13 +2598,13 @@ impl Default for DisplaySettingsState {
             confirmed_clock_info_opacity: 100,
             clock_modifiers_visible: true,
             confirmed_clock_modifiers_visible: true,
-            clock_modifiers_color: [255, 255, 255],
-            confirmed_clock_modifiers_color: [255, 255, 255],
+            clock_modifiers_color: [209, 177, 139],
+            confirmed_clock_modifiers_color: [209, 177, 139],
             clock_modifiers_opacity: 100,
             confirmed_clock_modifiers_opacity: 100,
             clock_info_color_supported: false,
-            clock_info_color: [255, 255, 255],
-            confirmed_clock_info_color: [255, 255, 255],
+            clock_info_color: [209, 177, 139],
+            confirmed_clock_info_color: [209, 177, 139],
             clock_background_asset_supported: false,
             clock_background_kind: 0,
             clock_background_frames: 0,
@@ -2733,7 +2733,7 @@ pub(crate) fn load_display_settings(
     let clock_text_color = if clock_settings_supported {
         read_display_rgb(dev_conn, CLOCK_TEXT_COLOR_QSIDS)?
     } else {
-        [255, 255, 255]
+        color
     };
     let clock_overlay_controls_supported = [
         CLOCK_VISIBLE_QSID,
@@ -2774,7 +2774,7 @@ pub(crate) fn load_display_settings(
     let clock_modifiers_color = if clock_overlay_controls_supported {
         read_display_rgb(dev_conn, CLOCK_MODIFIERS_COLOR_QSIDS)?
     } else {
-        [255, 255, 255]
+        color
     };
     let clock_modifiers_opacity = if clock_overlay_controls_supported {
         read_display_setting_u8(dev_conn, CLOCK_MODIFIERS_OPACITY_QSID)?.min(100)
@@ -2788,7 +2788,7 @@ pub(crate) fn load_display_settings(
     let clock_info_color = if clock_info_color_supported {
         read_display_rgb(dev_conn, CLOCK_INFO_COLOR_QSIDS)?
     } else {
-        [255, 255, 255]
+        color
     };
     let clock_background_dim_supported =
         clock_settings_supported && supported_qmk_settings.contains(&CLOCK_BACKGROUND_DIM_QSID);

@@ -1,5 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod action_icons;
 mod app;
 #[cfg(not(target_arch = "wasm32"))]
 mod app_discovery;
@@ -8,6 +9,8 @@ mod application_layouts;
 mod device;
 mod diagnostics;
 mod firmware;
+mod firmware_builtin_icons;
+mod integration_icons;
 #[cfg(not(target_arch = "wasm32"))]
 mod hid;
 mod i18n;

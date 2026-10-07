@@ -510,8 +510,17 @@ impl SharedHidOutput {
         mode: crate::qmk_hid_host::HostDataMode,
         extended: bool,
     ) -> Self {
+        self.for_host_bridge_with_sm62(mode, extended, false)
+    }
+
+    pub(crate) fn for_host_bridge_with_sm62(
+        &self,
+        mode: crate::qmk_hid_host::HostDataMode,
+        extended: bool,
+        sm62: bool,
+    ) -> Self {
         let mut output = self.clone();
-        output.host_lease = Some(self.host_output.claim(mode, extended));
+        output.host_lease = Some(self.host_output.claim_sm62(mode, extended, sm62));
         output
     }
 

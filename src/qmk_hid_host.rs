@@ -6,6 +6,8 @@ use std::sync::{
     Arc, Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
+#[cfg(any(target_os = "windows", test))]
+use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
 const RAW_HID_PACKET_LEN: usize = 32;
@@ -15,18 +17,153 @@ const DATA_LAYOUT: u8 = 0xAC;
 const DATA_MEDIA_ARTIST: u8 = 0xAD;
 const DATA_MEDIA_TITLE: u8 = 0xAE;
 const DATA_DATE: u8 = 0xAF;
+// SM62 firmware: elapsed seconds (LE32), then total seconds (LE32).
+const DATA_SM62_MEDIA_PROGRESS: u8 = 0xB1;
+const SM62_VENDOR_ID: u16 = 0xE126;
+const SM62_PRODUCT_ID: u16 = 0x00B2;
 const DEFAULT_LAYOUT_CODES: [&str; 2] = ["en", "ru"];
 const LAYOUT_RESEND_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(target_os = "windows")]
+const MEDIA_POLL_INTERVAL: Duration = Duration::from_millis(500);
+#[cfg(not(target_os = "windows"))]
+const MEDIA_POLL_INTERVAL: Duration = Duration::from_secs(1);
 // One process-wide desktop sampler, not one uninterruptible query thread per
 // bridge/reconnect. It never owns HID or a host-output lease. Demand and cached
 // results share one short-held lock; no desktop call executes under that lock.
 static HOST_DATA_SERVICE: OnceLock<HostDataService> = OnceLock::new();
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MediaInfo {
+    artist: String,
+    title: String,
+    position_seconds: Option<u32>,
+    duration_seconds: Option<u32>,
+}
+
+impl MediaInfo {
+    fn progress_payload(&self) -> [u8; 9] {
+        let duration = self.duration_seconds.unwrap_or(0);
+        let position = self.position_seconds.unwrap_or(0).min(duration);
+        let mut packet = [0; 9];
+        packet[0] = DATA_SM62_MEDIA_PROGRESS;
+        packet[1..5].copy_from_slice(&position.to_le_bytes());
+        packet[5..9].copy_from_slice(&duration.to_le_bytes());
+        packet
+    }
+}
+
+// Some Windows media sessions publish a position only when the user seeks.
+// Keep the displayed clock moving between samples, but re-anchor immediately
+// when the session, track, position or playback state changes.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Default)]
+struct MediaProgressClock {
+    identity: String,
+    raw_position: Option<Duration>,
+    last_updated_ticks: Option<i64>,
+    playing: bool,
+    anchor: Option<Instant>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl MediaProgressClock {
+    fn update(
+        &mut self,
+        identity: &str,
+        raw_position: Option<Duration>,
+        last_updated_ticks: Option<i64>,
+        sample_age: Option<Duration>,
+        playing: bool,
+        duration: Option<u32>,
+        now: Instant,
+    ) -> Option<u32> {
+        if self.anchor.is_none()
+            || self.identity != identity
+            || self.raw_position != raw_position
+            || self.playing != playing
+        {
+            let resumed_without_new_timeline = !self.playing
+                && playing
+                && self.last_updated_ticks == last_updated_ticks
+                && self.identity == identity;
+            self.identity = identity.to_owned();
+            self.raw_position = raw_position;
+            self.last_updated_ticks = last_updated_ticks;
+            self.playing = playing;
+            self.anchor = Some(if playing && !resumed_without_new_timeline {
+                now.checked_sub(sample_age.unwrap_or_default())
+                    .unwrap_or(now)
+            } else {
+                now
+            });
+        }
+        let position = raw_position?;
+        let elapsed = if playing {
+            now.duration_since(self.anchor?)
+        } else {
+            Duration::ZERO
+        };
+        Some(
+            position
+                .saturating_add(elapsed)
+                .as_secs()
+                .min(duration.unwrap_or(u32::MAX) as u64) as u32,
+        )
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_timeline_sample_age(last_updated_ticks: i64, now: SystemTime) -> Option<Duration> {
+    // WinRT DateTime and FILETIME both count 100 ns intervals since 1601-01-01.
+    const UNIX_EPOCH_TICKS: i128 = 116_444_736_000_000_000;
+    const TICKS_PER_SECOND: i128 = 10_000_000;
+    let unix_age = now.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    let now_ticks = UNIX_EPOCH_TICKS
+        + (unix_age.as_secs() as i128) * TICKS_PER_SECOND
+        + (unix_age.subsec_nanos() as i128) / 100;
+    let age_ticks = now_ticks - last_updated_ticks as i128;
+    // Missing/invalid timestamps must not jump the clock far into a track.
+    if last_updated_ticks <= 0 || !(0..=3_600 * TICKS_PER_SECOND).contains(&age_ticks) {
+        return None;
+    }
+    Some(Duration::from_nanos((age_ticks * 100) as u64))
+}
+
+fn supports_sm62_media_progress(device: &crate::device::Device) -> bool {
+    device.vendor_id == SM62_VENDOR_ID && device.product_id == SM62_PRODUCT_ID
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_timeline_seconds(
+    start_ticks: Option<i64>,
+    end_ticks: Option<i64>,
+    max_seek_ticks: Option<i64>,
+    position_ticks: Option<i64>,
+) -> (Option<u32>, Option<u32>) {
+    const TICKS_PER_SECOND: i64 = 10_000_000;
+    // Some media sessions publish EndTime/Position but not StartTime.
+    let start = start_ticks.unwrap_or(0);
+    let duration = end_ticks
+        .filter(|end| *end > start)
+        .or_else(|| max_seek_ticks.filter(|end| *end > start))
+        .and_then(|end| u32::try_from((end - start) / TICKS_PER_SECOND).ok())
+        .filter(|seconds| *seconds > 0);
+    let position = position_ticks
+        .and_then(|position| {
+            u32::try_from(position.saturating_sub(start).max(0) / TICKS_PER_SECOND).ok()
+        })
+        .map(|position| duration.map_or(position, |duration| position.min(duration)));
+    (position, duration)
+}
+
 pub fn media_snapshot() -> Option<(String, String)> {
     HOST_DATA_SERVICE
         .get()
         .and_then(|service| service.snapshot().media)
-        .filter(|(artist, title)| !artist.is_empty() || !title.is_empty())
+        .and_then(|media| {
+            (!media.artist.is_empty() || !media.title.is_empty())
+                .then_some((media.artist, media.title))
+        })
 }
 
 #[derive(Clone, Default)]
@@ -34,7 +171,7 @@ struct DesktopSnapshot {
     volume: Option<u8>,
     layout: Option<u8>,
     // None means no completed sample, Some(empty) means playback stopped.
-    media: Option<(String, String)>,
+    media: Option<MediaInfo>,
     media_query_ms: u128,
     media_sampled_at: Option<Instant>,
 }
@@ -73,7 +210,7 @@ struct HostDataService {
 trait DesktopSource {
     fn volume(&mut self) -> Option<u8>;
     fn layout(&mut self) -> Option<u8>;
-    fn media(&mut self) -> Option<(String, String)>;
+    fn media(&mut self) -> Option<MediaInfo>;
 }
 
 struct NativeDesktopSource {
@@ -105,7 +242,7 @@ impl DesktopSource for NativeDesktopSource {
             .and_then(LayoutTracker::current_layout_index)
     }
 
-    fn media(&mut self) -> Option<(String, String)> {
+    fn media(&mut self) -> Option<MediaInfo> {
         current_media_info()
     }
 }
@@ -189,7 +326,7 @@ fn run_desktop_service(shared: Arc<DesktopShared>, mut source: impl DesktopSourc
     let intervals = [
         VOLUME_POLL_INTERVAL,
         Duration::from_millis(100),
-        Duration::from_secs(3),
+        MEDIA_POLL_INTERVAL,
     ];
     let mut last_poll = [Instant::now() - Duration::from_secs(60); 3];
     let mut last_epoch = [0; 3];
@@ -263,8 +400,12 @@ impl<M: FnMut() -> Option<(String, String)>> DesktopSource for TestMediaSource<M
     fn layout(&mut self) -> Option<u8> {
         panic!("media-only fixture must not query real desktop layout")
     }
-    fn media(&mut self) -> Option<(String, String)> {
-        (self.0)()
+    fn media(&mut self) -> Option<MediaInfo> {
+        (self.0)().map(|(artist, title)| MediaInfo {
+            artist,
+            title,
+            ..Default::default()
+        })
     }
 }
 
@@ -698,6 +839,7 @@ struct HostOutputFootprint {
     generation: u64,
     mode: HostDataMode,
     extended: bool,
+    sm62: bool,
 }
 
 #[derive(Clone)]
@@ -708,6 +850,15 @@ pub(crate) struct HostOutputLease {
 
 impl HostOutputOwner {
     pub(crate) fn claim(self: &Arc<Self>, mode: HostDataMode, extended: bool) -> HostOutputLease {
+        self.claim_sm62(mode, extended, false)
+    }
+
+    pub(crate) fn claim_sm62(
+        self: &Arc<Self>,
+        mode: HostDataMode,
+        extended: bool,
+        sm62: bool,
+    ) -> HostOutputLease {
         let generation = self
             .generation
             .fetch_add(1, Ordering::SeqCst)
@@ -718,6 +869,7 @@ impl HostOutputOwner {
                 generation,
                 mode,
                 extended,
+                sm62,
             },
         }
     }
@@ -747,7 +899,7 @@ impl HostOutputLease {
                     media: old.mode.media && !self.footprint.mode.media,
                     ..Default::default()
                 };
-                for clear in shutdown_payloads(removed, old.extended) {
+                for clear in shutdown_payloads_for_device(removed, old.extended, old.sm62) {
                     send(&clear)?;
                 }
             }
@@ -772,14 +924,16 @@ impl HostOutputLease {
         }
         let mut mode = self.footprint.mode;
         let mut extended = self.footprint.extended;
+        let mut sm62 = self.footprint.sm62;
         if let Some(old) = *active {
             mode.time |= old.mode.time;
             mode.media |= old.mode.media;
             extended |= old.extended;
+            sm62 |= old.sm62;
         }
         // A final shutdown is a single ordered batch. A concurrent new claim
         // never blocks the UI and its worker writes only after this batch ends.
-        for clear in shutdown_payloads(mode, extended) {
+        for clear in shutdown_payloads_for_device(mode, extended, sm62) {
             send(&clear)?;
         }
         *active = None;
@@ -901,7 +1055,11 @@ impl QmkHidHostBridge {
             + 'static,
     ) -> Self {
         let shared_output = shared_output.map(|output| {
-            output.for_host_bridge(mode, matches!(protocol, HostProtocol::Selected(true)))
+            output.for_host_bridge_with_sm62(
+                mode,
+                matches!(protocol, HostProtocol::Selected(true)),
+                supports_sm62_media_progress(&device),
+            )
         });
         let control = Arc::new(BridgeTransportControl::default());
         let worker_control = control.clone();
@@ -1311,7 +1469,9 @@ fn run_bridge(
                 .is_some_and(|at| at > last_media_poll)
         {
             last_media_poll = snapshot.media_sampled_at.unwrap();
-            let (artist, title) = snapshot.media.unwrap_or_default();
+            let media = snapshot.media.unwrap_or_default();
+            let artist = &media.artist;
+            let title = &media.title;
             log::debug!(
                 "qmk-hid-host media query: target={:?} elapsed_ms={}",
                 target.path,
@@ -1321,14 +1481,18 @@ fn run_bridge(
                 break;
             }
             let full_resend = last_media_full_send.elapsed() >= Duration::from_secs(10);
-            if full_resend || artist != last_artist {
+            if full_resend || artist != &last_artist {
                 last_artist = artist.clone();
-                write_failed |= write_text_payload(dev, DATA_MEDIA_ARTIST, &artist).is_err();
+                write_failed |= write_text_payload(dev, DATA_MEDIA_ARTIST, artist).is_err();
                 pause_between_packets();
             }
-            if full_resend || title != last_title {
+            if full_resend || title != &last_title {
                 last_title = title.clone();
-                write_failed |= write_text_payload(dev, DATA_MEDIA_TITLE, &title).is_err();
+                write_failed |= write_text_payload(dev, DATA_MEDIA_TITLE, title).is_err();
+                pause_between_packets();
+            }
+            if supports_sm62_media_progress(&target) {
+                write_failed |= write_payload(dev, &media.progress_payload()).is_err();
                 pause_between_packets();
             }
             if full_resend {
@@ -1365,7 +1529,12 @@ fn run_bridge(
                     crate::application_layouts::ApplicationLayoutSnapshot::deactivate_packet();
                 let _ = write_payload(device, &packet);
             }
-            send_shutdown_payloads(device, mode, extended_protocol);
+            send_shutdown_payloads(
+                device,
+                mode,
+                extended_protocol,
+                supports_sm62_media_progress(&target),
+            );
         } else if let Some(output) = shared_output.as_ref() {
             // A successor stopped before opening must also finish any retained
             // mode footprint; this uses the existing owner, never a reopened path.
@@ -1417,8 +1586,13 @@ fn layout_needs_send(
     last_layout != Some(layout) || elapsed_since_last_send >= LAYOUT_RESEND_INTERVAL
 }
 
-fn send_shutdown_payloads(device: &HostDataHid, mode: HostDataMode, extended_protocol: bool) {
-    let payloads = shutdown_payloads(mode, extended_protocol);
+fn send_shutdown_payloads(
+    device: &HostDataHid,
+    mode: HostDataMode,
+    extended_protocol: bool,
+    sm62: bool,
+) {
+    let payloads = shutdown_payloads_for_device(mode, extended_protocol, sm62);
     if let HostDataHid::Shared(output) = device {
         if let Err(error) = output.write_host_shutdown(&payloads) {
             log::warn!("qmk-hid-host shutdown write failed: {error}");
@@ -1435,6 +1609,14 @@ fn send_shutdown_payloads(device: &HostDataHid, mode: HostDataMode, extended_pro
 }
 
 fn shutdown_payloads(mode: HostDataMode, extended_protocol: bool) -> Vec<Vec<u8>> {
+    shutdown_payloads_for_device(mode, extended_protocol, false)
+}
+
+fn shutdown_payloads_for_device(
+    mode: HostDataMode,
+    extended_protocol: bool,
+    sm62: bool,
+) -> Vec<Vec<u8>> {
     let mut payloads = Vec::new();
     // Never reopen a device or send BA to firmware that has not advertised it.
     if mode.time && extended_protocol {
@@ -1443,6 +1625,9 @@ fn shutdown_payloads(mode: HostDataMode, extended_protocol: bool) -> Vec<Vec<u8>
     if mode.media {
         payloads.push(vec![DATA_MEDIA_ARTIST, 0]);
         payloads.push(vec![DATA_MEDIA_TITLE, 0]);
+        if sm62 {
+            payloads.push(MediaInfo::default().progress_payload().to_vec());
+        }
     }
     payloads
 }
@@ -1575,43 +1760,57 @@ fn current_volume_percent() -> Option<u8> {
 }
 
 #[cfg(target_os = "windows")]
-fn current_media_info() -> Option<(String, String)> {
+fn current_media_info() -> Option<MediaInfo> {
     windows_platform::media_info()
 }
 
 #[cfg(target_os = "linux")]
-fn current_media_info() -> Option<(String, String)> {
+fn current_media_info() -> Option<MediaInfo> {
     command_stdout(
         "playerctl",
-        &["metadata", "--format", "{{artist}}\t{{title}}"],
+        &[
+            "-a",
+            "metadata",
+            "--format",
+            "{{playerName}}\t{{status}}\t{{artist}}\t{{title}}\t{{mpris:length}}",
+        ],
     )
-    .and_then(|out| split_media_line(&out))
+    .and_then(|out| split_playerctl_all_metadata(&out))
     .or_else(|| {
         command_stdout(
             "playerctl",
             &[
-                "-a",
                 "metadata",
                 "--format",
-                "{{status}}\t{{artist}}\t{{title}}",
+                "{{artist}}\t{{title}}\t{{mpris:length}}",
             ],
         )
-        .and_then(|out| split_playerctl_all_metadata(&out))
+        .and_then(|out| split_media_line(&out))
+        .map(|mut media| {
+            media.position_seconds = playerctl_position(None);
+            media
+        })
     })
     .or_else(mpris_media_info_via_gdbus)
 }
 
 #[cfg(target_os = "macos")]
-fn current_media_info() -> Option<(String, String)> {
+fn current_media_info() -> Option<MediaInfo> {
     let script = r#"
 set mediaArtist to ""
 set mediaTitle to ""
+set mediaPosition to ""
+set mediaDuration to ""
 tell application "System Events"
     if exists process "Spotify" then
         tell application "Spotify"
             if player state is not stopped then
                 set mediaArtist to artist of current track
                 set mediaTitle to name of current track
+                try
+                    set mediaPosition to player position
+                    set mediaDuration to duration of current track / 1000
+                end try
             end if
         end tell
     else if exists process "Music" then
@@ -1619,11 +1818,15 @@ tell application "System Events"
             if player state is not stopped then
                 set mediaArtist to artist of current track
                 set mediaTitle to name of current track
+                try
+                    set mediaPosition to player position
+                    set mediaDuration to duration of current track
+                end try
             end if
         end tell
     end if
 end tell
-return mediaArtist & tab & mediaTitle
+return mediaArtist & tab & mediaTitle & tab & mediaPosition & tab & mediaDuration
 "#;
     macos_automation_stdout(&["-e", script]).and_then(|out| split_media_line(&out))
 }
@@ -1711,7 +1914,7 @@ fn macos_layout_code_on_main_thread() -> Option<String> {
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-fn current_media_info() -> Option<(String, String)> {
+fn current_media_info() -> Option<MediaInfo> {
     None
 }
 
@@ -1767,13 +1970,43 @@ fn command_stdout_timeout_with_poll(
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-fn split_media_line(line: &str) -> Option<(String, String)> {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn split_media_line(line: &str) -> Option<MediaInfo> {
     let line = line.trim_end_matches(['\r', '\n']);
-    let mut parts = line.splitn(2, '\t');
+    let mut parts = line.splitn(4, '\t');
     let artist = parts.next().unwrap_or_default().trim().to_string();
     let title = parts.next().unwrap_or_default().trim().to_string();
-    (!artist.is_empty() || !title.is_empty()).then_some((artist, title))
+    #[cfg(target_os = "linux")]
+    let (position_seconds, duration_seconds) = (None, parts.next().and_then(parse_microseconds));
+    #[cfg(target_os = "macos")]
+    let (position_seconds, duration_seconds) = (
+        parts.next().and_then(parse_seconds),
+        parts.next().and_then(parse_seconds),
+    );
+    (!artist.is_empty() || !title.is_empty()).then_some(MediaInfo {
+        artist,
+        title,
+        position_seconds,
+        duration_seconds,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn parse_seconds(value: &str) -> Option<u32> {
+    let seconds = value.trim().parse::<f64>().ok()?;
+    (seconds.is_finite() && seconds >= 0.0 && seconds <= u32::MAX as f64)
+        .then_some(seconds.floor() as u32)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_microseconds(value: &str) -> Option<u32> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()?
+        .checked_div(1_000_000)?
+        .try_into()
+        .ok()
 }
 
 #[cfg(all(test, not(target_os = "windows")))]
@@ -2450,26 +2683,50 @@ impl LayoutTracker {
 }
 
 #[cfg(target_os = "linux")]
-fn split_playerctl_all_metadata(output: &str) -> Option<(String, String)> {
+fn playerctl_position(player: Option<&str>) -> Option<u32> {
+    let args = match player {
+        Some(name) => vec!["-p", name, "position"],
+        None => vec!["position"],
+    };
+    command_stdout("playerctl", &args)
+        .as_deref()
+        .and_then(parse_seconds)
+}
+
+#[cfg(target_os = "linux")]
+fn split_playerctl_all_metadata(output: &str) -> Option<MediaInfo> {
     let mut fallback = None;
     for line in output.lines() {
-        let mut parts = line.splitn(3, '\t');
+        let mut parts = line.splitn(5, '\t');
+        let player = parts.next().unwrap_or_default().trim();
         let status = parts.next().unwrap_or_default().trim();
         let artist = parts.next().unwrap_or_default().trim().to_string();
         let title = parts.next().unwrap_or_default().trim().to_string();
         if artist.is_empty() && title.is_empty() {
             continue;
         }
+        let media = MediaInfo {
+            artist,
+            title,
+            position_seconds: None,
+            duration_seconds: parts.next().and_then(parse_microseconds),
+        };
         if status.eq_ignore_ascii_case("playing") {
-            return Some((artist, title));
+            return Some(MediaInfo {
+                position_seconds: playerctl_position(Some(player)),
+                ..media
+            });
         }
-        fallback.get_or_insert((artist, title));
+        fallback.get_or_insert((player.to_string(), media));
     }
-    fallback
+    fallback.map(|(player, media)| MediaInfo {
+        position_seconds: playerctl_position(Some(&player)),
+        ..media
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn mpris_media_info_via_gdbus() -> Option<(String, String)> {
+fn mpris_media_info_via_gdbus() -> Option<MediaInfo> {
     let names = command_stdout(
         "gdbus",
         &[
@@ -2492,9 +2749,12 @@ fn mpris_media_info_via_gdbus() -> Option<(String, String)> {
         let Some(metadata) = gdbus_get_mpris_property(&name, "Metadata") else {
             continue;
         };
-        let Some(media) = split_gdbus_mpris_metadata(&metadata) else {
+        let Some(mut media) = split_gdbus_mpris_metadata(&metadata) else {
             continue;
         };
+        media.position_seconds = gdbus_get_mpris_property(&name, "Position")
+            .as_deref()
+            .and_then(gvariant_microseconds);
         let is_playing = gdbus_get_mpris_property(&name, "PlaybackStatus")
             .map(|status| status.contains("'Playing'") || status.contains("\"Playing\""))
             .unwrap_or(false);
@@ -2526,10 +2786,27 @@ fn gdbus_get_mpris_property(name: &str, property: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn split_gdbus_mpris_metadata(metadata: &str) -> Option<(String, String)> {
+fn split_gdbus_mpris_metadata(metadata: &str) -> Option<MediaInfo> {
     let artist = gvariant_metadata_string(metadata, "xesam:artist").unwrap_or_default();
     let title = gvariant_metadata_string(metadata, "xesam:title").unwrap_or_default();
-    (!artist.is_empty() || !title.is_empty()).then_some((artist, title))
+    (!artist.is_empty() || !title.is_empty()).then_some(MediaInfo {
+        artist,
+        title,
+        position_seconds: None,
+        duration_seconds: metadata
+            .find("mpris:length")
+            .and_then(|index| gvariant_microseconds(&metadata[index + "mpris:length".len()..])),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn gvariant_microseconds(value: &str) -> Option<u32> {
+    let after_type = value
+        .split_once("int64 ")
+        .map(|(_, tail)| tail)
+        .or_else(|| value.split_once('<').map(|(_, tail)| tail))?;
+    let number = after_type.split(|c: char| !c.is_ascii_digit()).next()?;
+    parse_microseconds(number)
 }
 
 #[cfg(target_os = "linux")]
@@ -2573,8 +2850,14 @@ fn gvariant_quoted_strings(text: &str) -> Vec<String> {
 
 #[cfg(target_os = "windows")]
 mod windows_platform {
+    use std::cell::RefCell;
+    use std::time::Duration;
     use windows::{
-        Media::Control::GlobalSystemMediaTransportControlsSessionManager,
+        Media::Control::{
+            GlobalSystemMediaTransportControlsSession,
+            GlobalSystemMediaTransportControlsSessionManager,
+            GlobalSystemMediaTransportControlsSessionPlaybackStatus,
+        },
         Win32::{
             Media::Audio::{
                 eMultimedia, eRender, Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator,
@@ -2593,6 +2876,18 @@ mod windows_platform {
             WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId},
         },
     };
+
+    type SessionSample = (
+        super::MediaInfo,
+        bool,
+        String,
+        Option<Duration>,
+        Option<i64>,
+        Option<Duration>,
+    );
+    thread_local! {
+        static MEDIA_CLOCK: RefCell<super::MediaProgressClock> = RefCell::new(Default::default());
+    }
 
     pub fn volume_percent() -> Option<u8> {
         unsafe {
@@ -2616,18 +2911,144 @@ mod windows_platform {
         }
     }
 
-    pub fn media_info() -> Option<(String, String)> {
+    pub fn media_info() -> Option<super::MediaInfo> {
         let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
             .and_then(|request| request.get())
             .ok()?;
-        let session = manager.GetCurrentSession().ok()?;
+        let current = manager.GetCurrentSession().ok();
+        let current_info = current.as_ref().and_then(read_session);
+        if current_info
+            .as_ref()
+            .is_some_and(|(media, playing, ..)| *playing && media.duration_seconds.is_some())
+        {
+            return current_info.map(finish_sample);
+        }
+        // A metadata-only browser session may remain selected while another
+        // playing session publishes a usable timeline. Never combine metadata
+        // and timeline from different sessions.
+        if let Ok(sessions) = manager.GetSessions() {
+            for session in sessions {
+                if session
+                    .GetPlaybackInfo()
+                    .and_then(|info| info.PlaybackStatus())
+                    .ok()
+                    != Some(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing)
+                {
+                    continue;
+                }
+                if let Some(media) =
+                    read_session(&session).filter(|(media, ..)| media.duration_seconds.is_some())
+                {
+                    return Some(finish_sample(media));
+                }
+            }
+        }
+        current_info.map(finish_sample)
+    }
+
+    fn finish_sample(
+        (mut media, playing, identity, raw_position, last_updated_ticks, sample_age): SessionSample,
+    ) -> super::MediaInfo {
+        media.position_seconds = MEDIA_CLOCK.with(|clock| {
+            clock.borrow_mut().update(
+                &identity,
+                raw_position,
+                last_updated_ticks,
+                sample_age,
+                playing,
+                media.duration_seconds,
+                std::time::Instant::now(),
+            )
+        });
+        media
+    }
+
+    fn read_session(session: &GlobalSystemMediaTransportControlsSession) -> Option<SessionSample> {
         let props = session
             .TryGetMediaPropertiesAsync()
             .and_then(|request| request.get())
             .ok()?;
         let artist = props.Artist().unwrap_or_default().to_string();
         let title = props.Title().unwrap_or_default().to_string();
-        (!artist.is_empty() || !title.is_empty()).then_some((artist, title))
+        if artist.is_empty() && title.is_empty() {
+            return None;
+        }
+        let timeline_result = session.GetTimelineProperties();
+        if let Err(error) = &timeline_result {
+            log::debug!("Windows media timeline unavailable: {error}");
+        }
+        let timeline = timeline_result.ok();
+        let sampled_at = std::time::SystemTime::now();
+        let last_updated_ticks = timeline
+            .as_ref()
+            .and_then(|t| t.LastUpdatedTime().ok())
+            .map(|t| t.UniversalTime);
+        let sample_age = last_updated_ticks
+            .and_then(|ticks| super::windows_timeline_sample_age(ticks, sampled_at));
+        let raw_position = timeline
+            .as_ref()
+            .and_then(|t| t.Position().ok())
+            .map(|t| t.Duration);
+        let playback = session.GetPlaybackInfo().ok();
+        let playing = playback
+            .as_ref()
+            .and_then(|info| info.PlaybackStatus().ok())
+            == Some(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing);
+        let (position_seconds, duration_seconds) = super::windows_timeline_seconds(
+            timeline
+                .as_ref()
+                .and_then(|t| t.StartTime().ok())
+                .map(|t| t.Duration),
+            timeline
+                .as_ref()
+                .and_then(|t| t.EndTime().ok())
+                .map(|t| t.Duration),
+            timeline
+                .as_ref()
+                .and_then(|t| t.MaxSeekTime().ok())
+                .map(|t| t.Duration),
+            raw_position,
+        );
+        let start_ticks = timeline
+            .as_ref()
+            .and_then(|t| t.StartTime().ok())
+            .map(|t| t.Duration)
+            .unwrap_or(0);
+        let precise_position = raw_position.map(|position| {
+            Duration::from_nanos(
+                (position.saturating_sub(start_ticks).max(0) as u64).saturating_mul(100),
+            )
+        });
+        let source = session
+            .SourceAppUserModelId()
+            .unwrap_or_default()
+            .to_string();
+        log::debug!(
+            "Windows media session {}: start={:?} end={:?} max_seek={:?} position={:?} updated={:?} age={:?} playing={playing}; parsed={:?}/{:?}",
+            source,
+            timeline.as_ref().and_then(|t| t.StartTime().ok()).map(|t| t.Duration),
+            timeline.as_ref().and_then(|t| t.EndTime().ok()).map(|t| t.Duration),
+            timeline.as_ref().and_then(|t| t.MaxSeekTime().ok()).map(|t| t.Duration),
+            raw_position,
+            last_updated_ticks,
+            sample_age,
+            position_seconds,
+            duration_seconds
+        );
+        let identity = format!("{source}\0{artist}\0{title}\0{duration_seconds:?}");
+        Some((
+            super::MediaInfo {
+                artist,
+                title,
+                position_seconds,
+                duration_seconds,
+            },
+            playing,
+            identity,
+            precise_position,
+            last_updated_ticks,
+            sample_age,
+        ))
     }
 
     pub fn layout_code() -> Option<String> {
@@ -3252,4 +3673,111 @@ pub(crate) fn test_open_selected_owner(
     output: &crate::hid::SharedHidOutput,
 ) -> anyhow::Result<()> {
     open_host_data_hid(target, Some(output)).map(|_| ())
+}
+
+#[cfg(test)]
+mod sm62_timeline_tests {
+    use super::*;
+
+    #[test]
+    fn progress_packet_uses_elapsed_and_total_seconds() {
+        let info = MediaInfo {
+            position_seconds: Some(75),
+            duration_seconds: Some(230),
+            ..Default::default()
+        };
+        assert_eq!(info.progress_payload(), [0xB1, 75, 0, 0, 0, 230, 0, 0, 0]);
+        assert_eq!(
+            MediaInfo::default().progress_payload(),
+            [0xB1, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        let mode = HostDataMode {
+            media: true,
+            ..Default::default()
+        };
+        assert!(shutdown_payloads_for_device(mode, false, true)
+            .contains(&vec![0xB1, 0, 0, 0, 0, 0, 0, 0, 0]));
+        assert!(!shutdown_payloads_for_device(mode, false, false)
+            .iter()
+            .any(|packet| packet.first() == Some(&0xB1)));
+    }
+
+    #[test]
+    fn playback_advances_between_samples_and_resets_on_seek_or_track_change() {
+        let start = Instant::now();
+        let mut clock = MediaProgressClock::default();
+        assert_eq!(
+            clock.update(
+                "track A",
+                Some(Duration::from_secs(12)),
+                Some(1),
+                None,
+                true,
+                Some(90),
+                start
+            ),
+            Some(12)
+        );
+        assert_eq!(
+            clock.update(
+                "track A",
+                Some(Duration::from_secs(12)),
+                Some(1),
+                None,
+                true,
+                Some(90),
+                start + Duration::from_secs(2)
+            ),
+            Some(14)
+        );
+        assert_eq!(
+            clock.update(
+                "track A",
+                Some(Duration::from_secs(40)),
+                Some(2),
+                None,
+                true,
+                Some(90),
+                start + Duration::from_secs(3)
+            ),
+            Some(40)
+        );
+        assert_eq!(
+            clock.update(
+                "track A",
+                Some(Duration::from_secs(40)),
+                Some(2),
+                None,
+                false,
+                Some(90),
+                start + Duration::from_secs(5)
+            ),
+            Some(40)
+        );
+        assert_eq!(
+            clock.update(
+                "track B",
+                Some(Duration::ZERO),
+                Some(3),
+                None,
+                true,
+                Some(60),
+                start + Duration::from_secs(6)
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn missing_timeline_start_still_yields_duration_and_position() {
+        let ticks = |seconds: i64| seconds * 10_000_000;
+        assert_eq!(
+            windows_timeline_seconds(None, Some(ticks(230)), None, Some(ticks(75))),
+            (Some(75), Some(230))
+        );
+        assert_eq!(
+            windows_timeline_seconds(None, Some(0), Some(ticks(230)), Some(ticks(75))),
+            (Some(75), Some(230))
+        );
+    }
 }
