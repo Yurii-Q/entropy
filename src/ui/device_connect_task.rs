@@ -830,13 +830,14 @@ impl EntropyApp {
                     }
                 };
 
-                let supports_application_layouts = if !headless && dev.is_ergohaven_display_macropad() {
-                    let supported = dev_conn.supports_application_layout_protocol();
-                    log::info!("Application layout protocol supported: {supported}");
-                    supported
-                } else {
-                    false
-                };
+                let supports_application_layouts =
+                    if !headless && dev.is_ergohaven_display_macropad() {
+                        let supported = dev_conn.supports_application_layout_protocol();
+                        log::info!("Application layout protocol supported: {supported}");
+                        supported
+                    } else {
+                        false
+                    };
 
                 progress("Reading Vial layout definition…")?;
                 log::info!("Getting layout JSON…");
