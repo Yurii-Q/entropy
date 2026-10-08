@@ -262,6 +262,23 @@ mod app_settings_tests {
     use super::*;
 
     #[test]
+    fn tap_dance_keycap_keeps_slot_label_and_tooltip_keeps_custom_name() {
+        let names = &["t1".to_owned()];
+        assert_eq!(
+            keycode_label_with_macro_names(0x5700, &[], &[], &[], names, KeyLegendLayout::English),
+            "TD0"
+        );
+        assert_eq!(
+            keycode_tooltip_with_macro_names(0x5700, &[], &[], &[], &[], names),
+            "t1 — tap dance 0"
+        );
+        assert_eq!(
+            keycode_label_with_macro_names(0x5700, &[], &[], &[], &[], KeyLegendLayout::English),
+            "TD0"
+        );
+    }
+
+    #[test]
     fn app_settings_default_dark_mode_is_light() {
         assert!(!AppSettings::default().dark_mode);
     }
@@ -307,7 +324,7 @@ pub(crate) fn keycode_label_with_macro_names(
     custom: &[crate::keyboard::CustomKeycode],
     layer_names: &[String],
     macro_names: &[String],
-    tap_dance_names: &[String],
+    _tap_dance_names: &[String],
     key_legend_layout: KeyLegendLayout,
 ) -> String {
     if (0x7700..=0x77FF).contains(&value) {
@@ -319,9 +336,8 @@ pub(crate) fn keycode_label_with_macro_names(
     }
     if (0x5700..=0x57FF).contains(&value) {
         let idx = (value - 0x5700) as usize;
-        if let Some(name) = tap_dance_custom_name(tap_dance_names, idx) {
-            return format!("TD{}\n{}", idx, name);
-        }
+        // Keep the slot identifier on the keycap; the custom name belongs in
+        // the tooltip and editor, not on the macropad preview.
         return format!("TD{}", idx);
     }
     keycode_label_with_names_and_layout(value, custom, layer_names, key_legend_layout)
