@@ -1069,6 +1069,9 @@ impl EntropyApp {
     #[cfg(not(target_arch = "wasm32"))]
     fn finish_layer_write(&mut self, result: LayerWriteResult) {
         if result.context.is_default_layout_sync {
+            if result.progress.error.is_none() {
+                self.default_layout_pending_layers &= !(1u16 << result.context.layer);
+            }
             self.default_layout_sync_retry_after = result
                 .progress
                 .error

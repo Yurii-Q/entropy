@@ -641,6 +641,9 @@ impl EntropyApp {
         // relabel the still-live layout/HID of the previous keyboard.
         self.selected_device = Some(device_idx);
         self.pending_device_connect = None;
+        self.default_layout_device_reconciled = false;
+        self.default_layout_pending_layers = 0;
+        self.default_layout_sync_retry_after = None;
         self.pending_layout_undo = false;
         self.pending_layer_write = None;
 

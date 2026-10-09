@@ -5271,9 +5271,13 @@ pub struct EntropyApp {
         String,
         Option<crate::application_layouts::DetectedApplication>,
     )>,
-    /// Avoid retrying a failed automatic Default keymap write every UI tick.
+    /// Avoid retrying a failed, explicitly requested Default keymap write every UI tick.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) default_layout_sync_retry_after: Option<std::time::Instant>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) default_layout_device_reconciled: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) default_layout_pending_layers: u16,
     pub(crate) application_picker_open: bool,
     pub(crate) application_picker_assign_existing: bool,
     /// Stable profile selected when the edit dialog opens. Foreground changes

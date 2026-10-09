@@ -110,9 +110,13 @@ fn pictogram_name_error(
         return Some("display_settings.pictogram_name_format_error");
     }
     let normalized = name.to_lowercase();
-    if builtin_names
-        .iter()
-        .any(|builtin| builtin.trim().to_lowercase() == normalized)
+    let keeps_existing_name = selected_saved
+        .and_then(|index| saved.get(index))
+        .is_some_and(|icon| icon.name.trim().to_lowercase() == normalized);
+    if !keeps_existing_name
+        && builtin_names
+            .iter()
+            .any(|builtin| builtin.trim().to_lowercase() == normalized)
     {
         return Some("display_settings.pictogram_name_duplicate_error");
     }
@@ -258,44 +262,35 @@ fn is_superseded_stock_pictogram(key: &str) -> bool {
     )
 }
 
-// Keep the user's library intact on disk. Older Entropy releases mistakenly
-// promoted stock snapshots to `user`; hide those copies in both pickers,
-// including English stock names shown in a Russian-language UI.
+// Older Entropy releases could put a stock snapshot in `user`. Recognize only
+// an exact legacy stock record; a user drawing may legitimately reuse a stock
+// name, bitmap, or color independently.
+#[cfg(not(target_arch = "wasm32"))]
+fn is_known_migrated_stock_pictogram(icon: &SavedPictogram) -> bool {
+    if icon.color != [84, 189, 191] {
+        return false;
+    }
+    (0..38).any(|index| {
+        let name_matches = crate::i18n::Language::ALL.iter().any(|language| {
+            icon.name.trim() == crate::i18n::tr_catalog(*language, BUILTIN_PICTOGRAM_KEYS[index])
+        });
+        name_matches
+            && (icon.bitmap == legacy_builtin_pictogram_bitmap(index)
+                || icon.bitmap == builtin_pictogram_bitmap(index))
+    })
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn visible_saved_pictograms<'a>(
     saved: &'a [SavedPictogram],
-    catalog: &[CatalogIcon],
+    _catalog: &[CatalogIcon],
 ) -> Vec<&'a SavedPictogram> {
-    use std::collections::HashSet;
-    let mut names: HashSet<String> = crate::i18n::Language::ALL
+    saved
         .iter()
-        .flat_map(|language| {
-            BUILTIN_PICTOGRAM_KEYS.iter().map(move |key| {
-                crate::i18n::tr_catalog(*language, key)
-                    .trim()
-                    .to_lowercase()
-            })
+        .filter(|icon| {
+            icon.bitmap.len() == PICTOGRAM_BYTES && !is_known_migrated_stock_pictogram(icon)
         })
-        .collect();
-    names.extend(catalog.iter().map(|icon| icon.name.trim().to_lowercase()));
-    let mut bitmaps: HashSet<Vec<u8>> = (0..BUILTIN_PICTOGRAM_KEYS.len())
-        .map(|index| builtin_pictogram_bitmap(index).to_vec())
-        .collect();
-    bitmaps.extend((0..38).map(|index| legacy_builtin_pictogram_bitmap(index).to_vec()));
-    let mut visible = Vec::new();
-    for icon in saved {
-        if icon.bitmap.len() != PICTOGRAM_BYTES {
-            continue;
-        }
-        let name = icon.name.trim().to_lowercase();
-        if names.contains(&name) || bitmaps.contains(&icon.bitmap) {
-            continue;
-        }
-        names.insert(name);
-        bitmaps.insert(icon.bitmap.clone());
-        visible.push(icon);
-    }
-    visible
+        .collect()
 }
 
 // Order within each existing group. Keep these lists independent of the group
@@ -4948,9 +4943,9 @@ mod icon_catalog_tests {
     use super::*;
 
     #[test]
-    fn old_english_stock_copies_are_hidden_in_russian_picker() {
+    fn only_exact_migrated_stock_copies_are_hidden_in_russian_picker() {
         let catalog = pictogram_catalog(crate::i18n::Language::Russian);
-        let stock_index = BUILTIN_PICTOGRAM_KEYS.len() - 1;
+        let stock_index = 0;
         let stock_name = crate::i18n::tr_catalog(
             crate::i18n::Language::English,
             BUILTIN_PICTOGRAM_KEYS[stock_index],
@@ -4958,23 +4953,46 @@ mod icon_catalog_tests {
         let saved = vec![
             SavedPictogram {
                 name: stock_name.to_owned(),
-                color: [255, 255, 255],
-                bitmap: vec![0xA5; PICTOGRAM_BYTES],
+                color: [84, 189, 191],
+                bitmap: legacy_builtin_pictogram_bitmap(stock_index).to_vec(),
             },
             SavedPictogram {
                 name: "My drawing".to_owned(),
                 color: [255, 255, 255],
                 bitmap: vec![0x5A; PICTOGRAM_BYTES],
             },
-            SavedPictogram {
-                name: "Another name".to_owned(),
-                color: [255, 255, 255],
-                bitmap: builtin_pictogram_bitmap(0).to_vec(),
-            },
         ];
         let visible = visible_saved_pictograms(&saved, &catalog);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].name, "My drawing");
+    }
+
+    #[test]
+    fn saved_name_bitmap_and_recolored_stock_collisions_remain_selectable() {
+        let catalog = pictogram_catalog(crate::i18n::Language::English);
+        let stock_name =
+            crate::i18n::tr_catalog(crate::i18n::Language::English, BUILTIN_PICTOGRAM_KEYS[0]);
+        let saved = vec![
+            SavedPictogram {
+                name: stock_name.to_owned(),
+                color: [84, 189, 191],
+                bitmap: vec![0xA5; PICTOGRAM_BYTES],
+            },
+            SavedPictogram {
+                name: "My stock shape".to_owned(),
+                color: [84, 189, 191],
+                bitmap: builtin_pictogram_bitmap(0).to_vec(),
+            },
+            SavedPictogram {
+                name: stock_name.to_owned(),
+                color: [255, 0, 0],
+                bitmap: legacy_builtin_pictogram_bitmap(0).to_vec(),
+            },
+        ];
+        let visible = visible_saved_pictograms(&saved, &catalog);
+        assert_eq!(visible.len(), 3);
+        let builtin_names = vec![stock_name.to_owned()];
+        assert!(pictogram_name_error(stock_name, &saved[..1], Some(0), &builtin_names).is_none());
     }
 
     #[test]
